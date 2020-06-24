@@ -50,7 +50,8 @@ const cleanTagsState = () => ({
   all: [],
   valid: [],
   invalid: [],
-  duplicate: []
+  duplicate: [],
+  overflowed: []
 })
 
 // @vue/component
@@ -151,6 +152,10 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       type: String,
       default: () => getComponentConfig(NAME, 'invalidTagText')
     },
+    overflowedTagText: {
+      type: String,
+      default: () => getComponentConfig(NAME, 'overflowedTagText')
+    },
     separator: {
       // Character (or characters) that trigger adding tags
       type: [String, Array]
@@ -182,7 +187,12 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       // The v-model prop
       type: Array,
       default: () => []
-    }
+    },
+    limit: {
+      type: Number,
+      validator: (value) => value > 0
+    },
+    formatTag: Function
   },
   data() {
     return {
@@ -266,11 +276,17 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
     },
     hasInvalidTags() {
       return this.invalidTags.length > 0
+    },
+    overflowedTags() {
+      return this.tagsState.overflowed
+    },
+    hasOverflowedTags() {
+      return this.overflowedTags.length > 0
     }
   },
   watch: {
     value(newVal) {
-      this.tags = cleanTags(newVal)
+      this.tags = this.limitTags(cleanTags(newVal))
     },
     tags(newVal, oldVal) {
       // Update the `v-model` (if it differs from the value prop)
@@ -286,14 +302,14 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
     tagsState(newVal, oldVal) {
       // Emit a tag-state event when the `tagsState` object changes
       if (!looseEqual(newVal, oldVal)) {
-        this.$emit('tag-state', newVal.valid, newVal.invalid, newVal.duplicate)
+        this.$emit('tag-state', newVal.valid, newVal.invalid, newVal.duplicate, newVal.overflowed)
       }
     }
   },
   created() {
     // We do this in created to make sure an input event emits
     // if the cleaned tags are not equal to the value prop
-    this.tags = cleanTags(this.value)
+    this.tags = this.limitTags(cleanTags(this.value))
   },
   mounted() {
     this.handleAutofocus()
@@ -303,10 +319,10 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
     this.handleAutofocus()
   },
   methods: {
-    addTag(newTag) {
+    async addTag(newTag) {
       newTag = isString(newTag) ? newTag : this.newTag
       /* istanbul ignore next */
-      if (this.disabled || trim(newTag) === '') {
+      if (this.disabled || this.limit && this.limit <= this.tags.length || trim(newTag) === '') {
         // Early exit
         return
       }
@@ -314,19 +330,37 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       // Add any new tags to the `tags` array, or if the
       // array of `allTags` is empty, we clear the input
       if (parsed.valid.length > 0 || parsed.all.length === 0) {
-        // Clear the user input element (and leave in any invalid/duplicate tag(s)
+        // Clear the user input element (and leave in any invalid/duplicate/overflowed tag(s)
         /* istanbul ignore if: full testing to be added later */
         if (matches(this.getInput(), 'select')) {
           // The following is needed to properly
           // work with `<select>` elements
           this.newTag = ''
         } else {
-          const invalidAndDuplicates = [...parsed.invalid, ...parsed.duplicate]
+          const wrongTags = [...parsed.invalid, ...parsed.duplicate, ...parsed.overflowed]
           this.newTag = parsed.all
-            .filter(tag => arrayIncludes(invalidAndDuplicates, tag))
+            .filter(tag => arrayIncludes(wrongTags, tag))
             .join(this.computedJoiner)
-            .concat(invalidAndDuplicates.length > 0 ? this.computedJoiner.charAt(0) : '')
+            .concat(wrongTags.length > 0 ? this.computedJoiner.charAt(0) : '')
         }
+      }
+      if (parsed.valid.length > 0 && this.formatTag) {
+        // if there is a format function, number of valid tags can be reduced
+        const validTags = [];
+        for (const tag of parsed.valid) {
+          try {
+            const formattedTag = await this.formatTag(tag)
+            if (typeof formattedTag === 'string' && formattedTag) {
+              validTags.push(formattedTag);
+            } else {
+              parsed.invalid.push(tag)
+            }
+          } catch(err) {
+            console.warn(err.message||err)
+            parsed.invalid.push(tag)
+          }            
+        }
+        parsed.valid = validTags;
       }
       if (parsed.valid.length > 0) {
         // We add the new tags in one atomic operation
@@ -339,6 +373,18 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       // Attempt to re-focus the input (specifically for when using the Add
       // button, as the button disappears after successfully adding a tag
       this.focus()
+    },
+    limitTags(tags) {
+      if (this.limit && tags.length > this.limit) {
+        const stripCnt = tags.length - this.limit
+        const overflowedTags = tags.splice(-stripCnt, stripCnt);
+        for (tag of overflowedTags) {
+          if (!arrayIncludes(this.tagsState.overflowed, tag)) {
+            this.tagsState.overflowed.push(tag);
+          }
+        }
+      }
+      return tags
     },
     removeTag(tag) {
       /* istanbul ignore next */
@@ -358,7 +404,7 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
     // --- Input element event handlers ---
     onInputInput(evt) {
       /* istanbul ignore next: hard to test composition events */
-      if (this.disabled || (isEvent(evt) && evt.target.composing)) {
+      if (this.disabled || this.limit && this.limit <= this.tags.length || (isEvent(evt) && evt.target.composing)) {
         // `evt.target.composing` is set by Vue (`v-model` directive)
         // https://github.com/vuejs/vue/blob/dev/src/platforms/web/runtime/directives/model.js
         return
@@ -468,11 +514,19 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
         all: tags,
         valid: [],
         invalid: [],
-        duplicate: []
+        duplicate: [],
+        overflowed: []
       }
-      // Parse the unique tags
-      tags.forEach(tag => {
-        if (arrayIncludes(this.tags, tag) || arrayIncludes(parsed.valid, tag)) {
+      // Parse the unique tagsthis.tags
+      tags.forEach((tag, i) => {
+        // trip tags above limit and move them to invalid
+        if (this.limit && (this.tags.length + i + 1) > this.limit) {
+          // tags above limit
+          console.log('sdf')
+          if (!arrayIncludes(parsed.overflowed, tag)) {
+            parsed.overflowed.push(tag)
+          }
+        } else if (arrayIncludes(this.tags, tag) || arrayIncludes(parsed.valid, tag)) {
           // Unique duplicate tags
           if (!arrayIncludes(parsed.duplicate, tag)) {
             parsed.duplicate.push(tag)
@@ -513,8 +567,10 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       tagRemoveLabel,
       invalidTagText,
       duplicateTagText,
+      overflowedTagText,
       isInvalid,
       isDuplicate,
+      isOverflowed,
       disabled,
       placeholder,
       addButtonText,
@@ -553,12 +609,15 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
         invalidTagText && isInvalid ? this.safeId('__invalid_feedback__') : null
       const duplicateFeedbackId =
         duplicateTagText && isDuplicate ? this.safeId('__duplicate_feedback__') : null
+      const overflowedFeedbackId =
+        overflowedTagText && isOverflowed ? this.safeId('__overflowed_feedback__') : null
 
       // Compute the `aria-describedby` attribute value
       const ariaDescribedby = [
         inputAttrs['aria-describedby'],
         invalidFeedbackId,
-        duplicateFeedbackId
+        duplicateFeedbackId,
+        overflowedFeedbackId
       ]
         .filter(identity)
         .join(' ')
@@ -613,6 +672,9 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
         {
           key: '__li-input__',
           staticClass: 'flex-grow-1 mt-1',
+          class: {
+            'd-none': this.limit && this.limit <= this.tags.length
+          },
           attrs: {
             role: 'none',
             'aria-live': 'off',
@@ -636,7 +698,7 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
 
       // Assemble the feedback
       let $feedback = h()
-      if (invalidTagText || duplicateTagText) {
+      if (invalidTagText || duplicateTagText || overflowedTagText) {
         // Add an aria live region for the invalid/duplicate tag
         // messages if the user has not disabled the messages
         const joiner = this.computedJoiner
@@ -667,13 +729,26 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
           )
         }
 
+        // Duplicate tag feedback if needed (warning, not error)
+        let $overflowed = h()
+        if (overflowedFeedbackId) {
+          $overflowed = h(
+            BFormText,
+            {
+              key: '_tags_overflowed_feedback_',
+              props: { id: overflowedFeedbackId }
+            },
+            [this.overflowedTagText, ': ', this.overflowedTags.join(joiner)]
+          )
+        }
+
         $feedback = h(
           'div',
           {
             key: '_tags_feedback_',
             attrs: { 'aria-live': 'polite', 'aria-atomic': 'true' }
           },
-          [$invalid, $duplicate]
+          [$invalid, $duplicate, $overflowed]
         )
       }
       // Return the content
@@ -696,11 +771,13 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       inputHandlers: this.computedInputHandlers,
       // <input> :id="inputId"
       inputId: this.computedInputId,
-      // Invalid/Duplicate state information
+      // Invalid/Duplicate/Overflowed state information
       invalidTags: this.invalidTags.slice(),
       isInvalid: this.hasInvalidTags,
       duplicateTags: this.duplicateTags.slice(),
       isDuplicate: this.hasDuplicateTags,
+      overflowedTags: this.overflowedTags.slice(),
+      isOverflowed: this.hasOverflowedTags,
       // If the 'Add' button should be disabled
       disableAddButton: this.disableAddButton,
       // Pass-though values
@@ -717,7 +794,8 @@ export const BFormTags = /*#__PURE__*/ Vue.extend({
       addButtonText: this.addButtonText,
       addButtonVariant: this.addButtonVariant,
       invalidTagText: this.invalidTagText,
-      duplicateTagText: this.duplicateTagText
+      duplicateTagText: this.duplicateTagText,
+      overflowedTagText: this.overflowedTagText
     }
 
     // Generate the user interface
